@@ -150,13 +150,46 @@ namespace FASTER.core
             }
 
             if (next.Phase == Phase.IN_PROGRESS)
+            {
                 base.GlobalBeforeEnteringState(next, faster);
+
+                // ✅ memory-scan in IN_PROGRESS
+                var iterator = faster.Log.Scan(faster.Log.BeginAddress, faster.Log.TailAddress);
+                while (iterator.GetNext(out RecordInfo recordInfo))
+                {
+                    if (!recordInfo.Invalid)  // 暂不判断 Version
+                    {
+                        long logical = iterator.CurrentAddress;
+                        long physical = faster.hlog.GetPhysicalAddress(logical);
+                        faster.checkpointBuffer.Add((logical, physical));
+
+                    }
+                }
+                Console.WriteLine($"[CPR-MEM] Collected {faster.checkpointBuffer.Count} records at IN_PROGRESS");
+            }
+
 
             if (next.Phase != Phase.WAIT_FLUSH) return;
 
             faster.hlog.ShiftReadOnlyToTail(out var tailAddress,
                 out faster._hybridLogCheckpoint.flushedSemaphore);
             faster._hybridLogCheckpoint.info.finalLogicalAddress = tailAddress;
+            // ✅ 插入你的 CPR flush 输出
+            var sw = Stopwatch.StartNew();
+
+            Parallel.ForEach(
+                faster.checkpointBuffer,
+                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                pair => {
+                    // 执行你的 flush 行为，比如复制、记录，当前什么都不做
+                }
+            );
+
+            sw.Stop();
+            Console.WriteLine($"[CPR-FLUSH] Flushed {faster.checkpointBuffer.Count} records in {sw.ElapsedMilliseconds} ms");
+
+            faster.checkpointBuffer.Clear();
+
         }
 
         /// <inheritdoc />
@@ -331,6 +364,25 @@ namespace FASTER.core
                         faster._hybridLogCheckpoint.deltaLog.InitializeForWrites(faster.hlog.bufferPool);
                     }
 
+
+                    // ✅ 🔽 插入你的异步 flush 到内存逻辑
+                    var sw = Stopwatch.StartNew();
+
+                    Parallel.ForEach(
+                        faster.checkpointBuffer,
+                        new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
+                        pair => {
+                            // 在这里做实际的 flush 操作，如果目前没内容就留空
+                        }
+                    );
+
+                    sw.Stop();
+                    Console.WriteLine($"[CPR-FLUSH] Flushed {faster.checkpointBuffer.Count} records in {sw.ElapsedMilliseconds} ms");
+
+                    faster.checkpointBuffer.Clear();
+
+
+                    // ✅ 🔼 插入结束
                     // We are writing delta records outside epoch protection, so callee should be able to
                     // handle corrupted or unexpected concurrent page changes during the flush, e.g., by
                     // resuming epoch protection if necessary. Correctness is not affected as we will

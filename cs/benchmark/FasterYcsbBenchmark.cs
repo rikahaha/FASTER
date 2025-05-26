@@ -4,6 +4,8 @@
 // Define below to enable continuous performance report for dashboard
 // #define DASHBOARD
 
+using System.Diagnostics;      // ✅ 添加这一行
+using System.IO;              // ✅ 添加这一行
 using FASTER.core;
 using System;
 using System.Diagnostics;
@@ -408,6 +410,34 @@ namespace FASTER.benchmark
             double opsPerSecond = total_ops_done / seconds;
             Console.WriteLine(TestStats.GetTotalOpsString(total_ops_done, seconds));
             Console.WriteLine(TestStats.GetStatsLine(StatsLineNum.Iteration, YcsbConstants.OpsPerSec, opsPerSecond));
+
+
+            // ✅ 手动触发 checkpoint
+            Console.WriteLine("[CPR] Manually triggering checkpoint...");
+            var swCheckpoint = Stopwatch.StartNew();     // ✅ 改名避免冲突
+            if (store.TryInitiateHybridLogCheckpoint(out _, CheckpointType.FoldOver))
+                {
+                    store.CompleteCheckpointAsync().AsTask().GetAwaiter().GetResult();
+                }
+
+            swCheckpoint.Stop();
+            long checkpointTimeMs = swCheckpoint.ElapsedMilliseconds;
+            Console.WriteLine($"[CPR] Checkpoint completed in {checkpointTimeMs} ms");
+
+            // ✅ 自动写入 CSV
+            int numThreads = testLoader.Options.ThreadCount;
+            int numKeys = testLoader.init_keys.Length;
+            double opsPerSec = opsPerSecond;
+            string method = "CPR";
+
+            string resultPath = "cpr_experiment_results.csv";
+            if (!File.Exists(resultPath))
+            {
+                File.WriteAllText(resultPath, "Timestamp,Threads,Keys,CheckpointMs,OpsPerSec,Method\n");
+            }
+            string line = $"{DateTime.Now},{numThreads},{numKeys},{checkpointTimeMs},{opsPerSec},{method}";
+            File.AppendAllText(resultPath, line + "\n");
+            Console.WriteLine($"[LOG] Result saved to {resultPath}");
             return (insertsPerSecond, opsPerSecond);
         }
 

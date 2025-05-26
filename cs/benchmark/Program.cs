@@ -3,6 +3,8 @@
 
 using System;
 using System.Threading;
+using System.Diagnostics;
+using System.IO;
 
 namespace FASTER.benchmark
 {

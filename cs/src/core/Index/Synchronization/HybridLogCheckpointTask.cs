@@ -16,6 +16,9 @@ namespace FASTER.core
     internal abstract class HybridLogCheckpointOrchestrationTask : ISynchronizationTask
     {
         private long lastVersion;
+        private long lastCheckpointVersion = -1; // ✅ 记录上次处理的版本号
+        private int checkpointAttemptCount = 0;  // ✅ 尝试次数统计
+        private int checkpointSkipCount = 0;      // ✅ 跳过次数统计
         /// <inheritdoc />
         public virtual void GlobalBeforeEnteringState<Key, Value>(SystemState next,
             FasterKV<Key, Value> faster)
@@ -31,10 +34,18 @@ namespace FASTER.core
                     }
                     faster._hybridLogCheckpoint.info.version = next.Version;
                     faster._hybridLogCheckpoint.info.startLogicalAddress = faster.hlog.GetTailAddress();
-                    // Capture begin address before checkpoint starts
                     faster._hybridLogCheckpoint.info.beginAddress = faster.hlog.BeginAddress;
                     break;
                 case Phase.IN_PROGRESS:
+                    checkpointAttemptCount++;
+                    if (lastCheckpointVersion == next.Version)
+                    {
+                        checkpointSkipCount++;
+                        Console.WriteLine($"[CPR] Skipping checkpoint for duplicate version {next.Version} (Skipped {checkpointSkipCount}/{checkpointAttemptCount})");
+                        return;
+                    }
+                    lastCheckpointVersion = next.Version;
+                    Console.WriteLine($"[CPR] Checkpoint started for version {next.Version} (Attempt #{checkpointAttemptCount}, Skipped: {checkpointSkipCount})");
                     faster.CheckpointVersionShift(lastVersion, next.Version);
                     break;
                 case Phase.WAIT_FLUSH:
@@ -51,14 +62,13 @@ namespace FASTER.core
                     var nextTcs = new TaskCompletionSource<LinkedCheckpointInfo>(TaskCreationOptions.RunContinuationsAsynchronously);
                     faster.checkpointTcs.SetResult(new LinkedCheckpointInfo { NextTask = nextTcs.Task });
                     faster.checkpointTcs = nextTcs;
+                    Console.WriteLine($"[CPR] Final checkpoint stats: {checkpointAttemptCount} attempts, {checkpointSkipCount} skipped.");
                     break;
             }
         }
 
         protected static void CollectMetadata<Key, Value>(SystemState next, FasterKV<Key, Value> faster)
         {
-            // Collect object log offsets only after flushes
-            // are completed
             var seg = faster.hlog.GetSegmentOffsets();
             if (seg != null)
             {
@@ -66,13 +76,9 @@ namespace FASTER.core
                 Array.Copy(seg, faster._hybridLogCheckpoint.info.objectLogSegmentOffsets, seg.Length);
             }
 
-            // Temporarily block new sessions from starting, which may add an entry to the table and resize the
-            // dictionary. There should be minimal contention here.
             lock (faster._activeSessions)
             {
                 List<int> toDelete = null;
-
-                // write dormant sessions to checkpoint
                 foreach (var kvp in faster._activeSessions)
                 {
                     kvp.Value.session.AtomicSwitch(next.Version - 1);
@@ -82,8 +88,6 @@ namespace FASTER.core
                         toDelete.Add(kvp.Key);
                     }
                 }
-
-                // delete any sessions that ended during checkpoint cycle
                 if (toDelete != null)
                 {
                     foreach (var key in toDelete)
@@ -91,20 +95,17 @@ namespace FASTER.core
                 }
             }
 
-            // Make sure previous recoverable sessions are re-checkpointed
             foreach (var item in faster.RecoverableSessions)
             {
                 faster._hybridLogCheckpoint.info.checkpointTokens.TryAdd(item.Item1, (item.Item2, item.Item3));
             }
         }
 
-        /// <inheritdoc />
         public virtual void GlobalAfterEnteringState<Key, Value>(SystemState next,
             FasterKV<Key, Value> faster)
         {
         }
 
-        /// <inheritdoc />
         public virtual void OnThreadState<Key, Value, Input, Output, Context, FasterSession>(
             SystemState current,
             SystemState prev, FasterKV<Key, Value> faster,
@@ -130,6 +131,10 @@ namespace FASTER.core
                 faster.GlobalStateMachineStep(current);
         }
     }
+
+    // 其他类保持不变
+
+
 
     /// <summary>
     /// A FoldOver checkpoint persists a version by setting the read-only marker past the last entry of that
@@ -174,21 +179,44 @@ namespace FASTER.core
             faster.hlog.ShiftReadOnlyToTail(out var tailAddress,
                 out faster._hybridLogCheckpoint.flushedSemaphore);
             faster._hybridLogCheckpoint.info.finalLogicalAddress = tailAddress;
-            // ✅ 插入你的 CPR flush 输出
+        // ✅ 插入你的 CPR flush 输出
+            // ✅ 替换掉原先的 Parallel.ForEach 为限流并发版本（例如一次只处理 16个任务）
             var sw = Stopwatch.StartNew();
+            var maxParallel = 32;
+            var queue = new Queue<(long logical, long physical)>(faster.checkpointBuffer);
 
-            Parallel.ForEach(
-                faster.checkpointBuffer,
-                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-                pair => {
-                    // 执行你的 flush 行为，比如复制、记录，当前什么都不做
-                }
-            );
+            List<Thread> threads = new List<Thread>();
+            object queueLock = new object();
+
+            for (int i = 0; i < maxParallel; i++)
+            {
+                var thread = new Thread(() =>
+                {
+                    while (true)
+                    {
+                        (long logical, long physical) item;
+                        lock (queueLock)
+                        {
+                            if (queue.Count == 0) break;
+                            item = queue.Dequeue();
+                        }
+
+                        // ✅ 实际 flush 操作写在这里
+                        // e.g. faster.hlog.WriteToCheckpoint(item.logical, item.physical);
+                    }
+                });
+                threads.Add(thread);
+                thread.Start();
+            }
+
+            foreach (var thread in threads)
+                thread.Join();
 
             sw.Stop();
             Console.WriteLine($"[CPR-FLUSH] Flushed {faster.checkpointBuffer.Count} records in {sw.ElapsedMilliseconds} ms");
 
             faster.checkpointBuffer.Clear();
+
 
         }
 

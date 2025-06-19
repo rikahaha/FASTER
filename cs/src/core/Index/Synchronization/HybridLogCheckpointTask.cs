@@ -6,6 +6,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections.Concurrent;
+
 
 namespace FASTER.core
 {
@@ -178,10 +180,13 @@ namespace FASTER.core
             var sw = Stopwatch.StartNew();
 
             Parallel.ForEach(
-                faster.checkpointBuffer,
-                new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount },
-                pair => {
-                    // 执行你的 flush 行为，比如复制、记录，当前什么都不做
+            Partitioner.Create(0, faster.checkpointBuffer.Count),
+            new ParallelOptions { MaxDegreeOfParallelism = 16 },
+            range => {
+                for (int i = range.Item1; i < range.Item2; i++) {
+                    var (logical, physical) = faster.checkpointBuffer[i];
+                    // flush logic
+                }
                 }
             );
 

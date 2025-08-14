@@ -1,6 +1,6 @@
 ﻿// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT license.
-
+//HybridLogCheckpointTask.cs
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -36,9 +36,14 @@ namespace FASTER.core
                         faster.InitializeHybridLogCheckpoint(faster._hybridLogCheckpointToken, next.Version);
                     }
                     faster._hybridLogCheckpoint.info.version = next.Version;
-                    faster._hybridLogCheckpoint.info.startLogicalAddress = faster.hlog.GetTailAddress();
+                    // ✅ 首次或“强制全量”时，从 BeginAddress 开始；否则可用增量起点
+                    var firstOrFull = faster.lastScannedTailAddress < 0 || faster.ForceFullOnNextCheckpoint; // 后面第2处会加这个标志
+                    faster._hybridLogCheckpoint.info.startLogicalAddress = firstOrFull
+                        ? faster.hlog.BeginAddress
+                        : faster.lastScannedTailAddress;
                     faster._hybridLogCheckpoint.info.beginAddress = faster.hlog.BeginAddress;
                     break;
+
 
                 case Phase.IN_PROGRESS:
                     checkpointAttemptCount++;
@@ -146,112 +151,76 @@ namespace FASTER.core
     /// </summary>
     internal sealed class FoldOverCheckpointTask : HybridLogCheckpointOrchestrationTask
     {
-        // 在 IN_PROGRESS 捕捉该次 CP 的 tail，WAIT_FLUSH 只等待到这个 tail 为止
         private long capturedTailForThisCP = -1;
+        private long requiredFlushAddress = -1;
 
-        /// <inheritdoc />
         public override void GlobalBeforeEnteringState<Key, Value>(SystemState next, FasterKV<Key, Value> faster)
         {
             base.GlobalBeforeEnteringState(next, faster);
 
-            if (next.Phase == Phase.PREPARE)
-            {
-                faster._lastSnapshotCheckpoint.Dispose();
-                if (faster.lastScannedTailAddress <= 0)
-                {
-                    // 第一次 CP：把增量扫描起点直接跳到当前 tail，避免扫历史
-                    faster.lastScannedTailAddress = faster.Log.TailAddress;
-                    Console.WriteLine("[CPR] Priming lastScannedTailAddress to tail for first CP");
-                }
-            }
-
             if (next.Phase == Phase.IN_PROGRESS)
             {
-                // 记录 IN_PROGRESS 时刻的 tail，作为本次需要保证 durable 的上界
-                long tail = faster.Log.TailAddress;
-                capturedTailForThisCP = tail;
+                // 捕捉本次 CP 的 tail
+                capturedTailForThisCP = faster.Log.TailAddress;
 
-                // 可选：增量内存扫描（统计/验证用，不参与 I/O）
-                long scanFrom = Math.Max(faster.Log.BeginAddress, faster.lastScannedTailAddress);
-                var iterator = faster.Log.Scan(scanFrom, tail);
+                bool fullScan = faster.ForceFullOnNextCheckpoint || faster.lastScannedTailAddress < 0;
+                long scanFrom = fullScan ? faster.Log.BeginAddress : faster.lastScannedTailAddress;
+                long scanTo   = capturedTailForThisCP;
 
-                int collected = 0;
-                while (iterator.GetNext(out RecordInfo recordInfo))
+                // ✅ 防止 scanFrom >= scanTo 导致 Partitioner.Create 抛异常
+                if (scanFrom >= scanTo)
                 {
-                    if (recordInfo.Invalid || recordInfo.Tombstone) continue;
+                    Console.WriteLine($"[CPR-MEM] No records to scan (from {scanFrom} to {scanTo})");
+                }
+                else
+                {
+                    var sw = Stopwatch.StartNew();
+                    int dop = Math.Min(Environment.ProcessorCount, 16);
+                    int pageSizeLogical = (int)faster.hlog.GetPageSize();
 
-                    // 先做“新版本”过滤（你这个 API 有，编得过）
-                    if (!recordInfo.IsInNewVersion) continue;
+                    var checkpointBag = new ConcurrentBag<(long logical, long physical)>();
+                    var rangePartition = Partitioner.Create(scanFrom, scanTo, pageSizeLogical);
 
-                    long logical = iterator.CurrentAddress;
+                    Parallel.ForEach(rangePartition, new ParallelOptions { MaxDegreeOfParallelism = dop }, slice =>
+                    {
+                        using var it = faster.Log.Scan(slice.Item1, slice.Item2);
+                        while (it.GetNext(out var ri))
+                        {
+                            if (ri.Invalid || ri.Tombstone) continue;
+                            if (!fullScan && !ri.IsInNewVersion) continue;
 
-                    // 先不取 physical，减少随机访存；需要时在并行阶段再取
-                    faster.checkpointBuffer.Add((logical, -1L));
+                            long logical = it.CurrentAddress;
+                            long physical = faster.hlog.GetPhysicalAddress(logical);
+                            checkpointBag.Add((logical, physical));
+                        }
+                    });
 
-                    collected++;
-                    faster.checkpointCollectedCount++;
+                    faster.checkpointBuffer.Clear();
+                    foreach (var tup in checkpointBag)
+                        faster.checkpointBuffer.Add(tup);
+
+                    sw.Stop();
+                    Console.WriteLine($"[CPR-MEM] Collected {faster.checkpointBuffer.Count} records " +
+                                    $"(from {scanFrom} to {scanTo}) in {sw.ElapsedMilliseconds} ms (||={dop})");
                 }
 
-                // 增量起点推进
-                faster.lastScannedTailAddress = tail;
-                Console.WriteLine($"[CPR-MEM] Collected {collected} records (from {scanFrom} to {tail})");
-
+                // 推进增量起点
+                faster.lastScannedTailAddress = capturedTailForThisCP;
             }
 
             if (next.Phase != Phase.WAIT_FLUSH) return;
 
-            // 1) 正常 fold-over：推进 RO 到 Tail，拿到 flushedSemaphore
+            // Fold-over：推进 RO 到 Tail
             faster.hlog.ShiftReadOnlyToTail(out var _, out faster._hybridLogCheckpoint.flushedSemaphore);
 
-            // 2) 仅等待到 IN_PROGRESS 捕获的 tail；可选回退一点减少卡尾
-            long final = capturedTailForThisCP;
-            const long TailSlackBytes = 1 << 20; // 1MB，可做 0/1MB/4MB A/B
-            final = Math.Max(faster.Log.BeginAddress, final - TailSlackBytes);
-            faster._hybridLogCheckpoint.info.finalLogicalAddress = final;
+            // 强一致 flush 目标
+            requiredFlushAddress = capturedTailForThisCP;
+            faster._hybridLogCheckpoint.info.finalLogicalAddress = requiredFlushAddress;
 
-            // 3) 并行补齐 physical（仅当为占位 -1 时才计算）
-            int n = faster.checkpointBuffer.Count;
-            if (n > 0)
-            {
-                var sw = Stopwatch.StartNew();
-                int dop = Math.Min(16, Environment.ProcessorCount);
-
-                var range = Partitioner.Create(0, n);
-                long fixedCount = 0;
-
-                Parallel.ForEach(range, new ParallelOptions { MaxDegreeOfParallelism = dop }, slice =>
-                {
-                    long localFixed = 0;
-                    var buf = faster.checkpointBuffer;
-
-                    for (int i = slice.Item1; i < slice.Item2; i++)
-                    {
-                        var tup = buf[i];
-                        // tup: (long logicalAddress, long physicalAddress)
-                        if (tup.Item2 == -1L) // 原来的 tup.physical
-                        {
-                            long physical = faster.hlog.GetPhysicalAddress(tup.Item1); // 原来的 tup.logical
-                            buf[i] = (tup.Item1, physical); // 回写：保持 (logicalAddress, physicalAddress) 顺序
-                            localFixed++;
-                        }
-                    }
-
-                    Interlocked.Add(ref fixedCount, localFixed);
-                });
-
-
-                sw.Stop();
-                Console.WriteLine($"[CPR-PHYS] Filled {fixedCount}/{n} physicals in {sw.ElapsedMilliseconds} ms (||={Math.Min(16, Environment.ProcessorCount)})");
-            }
-
-            // 4) 等待 flush 的逻辑保持你原来的（flushedSemaphore / epoch 标记）
-            // ...（不变）
-
-            // 5) 若只用于统计与校验，用完清空
-            faster.checkpointBuffer.Clear();
+            // flush 结束后清空 buffer
+            // （如果只是验证一致性，可以保留 buffer 作检查）
         }
 
-        /// <inheritdoc />
         public override void OnThreadState<Key, Value, Input, Output, Context, FasterSession>(
             SystemState current,
             SystemState prev,
@@ -269,15 +238,13 @@ namespace FASTER.core
             {
                 var s = faster._hybridLogCheckpoint.flushedSemaphore;
 
-                var notify = faster.hlog.FlushedUntilAddress >= faster._hybridLogCheckpoint.info.finalLogicalAddress;
-                notify = notify || !faster.SameCycle(ctx, current) || s == null;
-
-                if (valueTasks != null && !notify)
+                // 等待 flush 到 requiredFlushAddress
+                if (faster.hlog.FlushedUntilAddress < requiredFlushAddress)
                 {
-                    valueTasks.Add(new ValueTask(s.WaitAsync(token).ContinueWith(t => s.Release())));
+                    if (valueTasks != null && s != null)
+                        valueTasks.Add(new ValueTask(s.WaitAsync(token).ContinueWith(t => s.Release())));
+                    return;
                 }
-
-                if (!notify) return;
 
                 if (ctx is not null)
                     ctx.prevCtx.markers[EpochPhaseIdx.WaitFlush] = true;
@@ -289,14 +256,20 @@ namespace FASTER.core
         }
     }
 
+
     /// <summary>
     /// A Snapshot persists a version by making a copy for every entry of that version separate from the log. It is
     /// slower and more complex than a foldover, but more space-efficient on the log, and retains in-place
     /// update performance as it does not advance the readonly marker unnecessarily.
     /// </summary>
+/// <summary>
+/// 改良版 Snapshot：在 IN_PROGRESS 扫描 live data，WAIT_FLUSH 按 page flush snapshot
+/// </summary>
     internal sealed class SnapshotCheckpointTask : HybridLogCheckpointOrchestrationTask
     {
-        /// <inheritdoc />
+        private long capturedTailForThisCP = -1;
+        private long requiredFlushAddress = -1;
+
         public override void GlobalBeforeEnteringState<Key, Value>(SystemState next, FasterKV<Key, Value> faster)
         {
             switch (next.Phase)
@@ -307,11 +280,36 @@ namespace FASTER.core
                     faster._hybridLogCheckpoint.info.useSnapshotFile = 1;
                     break;
 
+                case Phase.IN_PROGRESS:
+                    // 捕捉 tail
+                    capturedTailForThisCP = faster.Log.TailAddress;
+
+                    // 全量或增量扫描 live data
+                    bool fullScan = faster.ForceFullOnNextCheckpoint || faster.lastScannedTailAddress < 0;
+                    long scanFrom = fullScan ? faster.Log.BeginAddress : faster.lastScannedTailAddress;
+                    using (var it = faster.Log.Scan(scanFrom, capturedTailForThisCP))
+                    {
+                        int collected = 0;
+                        while (it.GetNext(out var ri))
+                        {
+                            if (ri.Invalid || ri.Tombstone) continue;
+                            if (!fullScan && !ri.IsInNewVersion) continue;
+                            collected++;
+                        }
+                        Console.WriteLine($"[CPR-MEM] Collected {collected} records (from {scanFrom} to {capturedTailForThisCP})");
+                    }
+
+                    faster.lastScannedTailAddress = capturedTailForThisCP;
+                    break;
+
                 case Phase.WAIT_FLUSH:
                     base.GlobalBeforeEnteringState(next, faster);
+
+                    // 设置 flush 目标
                     faster._hybridLogCheckpoint.info.finalLogicalAddress = faster.hlog.GetTailAddress();
                     faster._hybridLogCheckpoint.info.snapshotFinalLogicalAddress = faster._hybridLogCheckpoint.info.finalLogicalAddress;
 
+                    // 初始化 snapshot 设备
                     faster._hybridLogCheckpoint.snapshotFileDevice =
                         faster.checkpointManager.GetSnapshotLogDevice(faster._hybridLogCheckpointToken);
                     faster._hybridLogCheckpoint.snapshotFileObjectLogDevice =
@@ -320,18 +318,16 @@ namespace FASTER.core
                     faster._hybridLogCheckpoint.snapshotFileObjectLogDevice.Initialize(-1);
 
                     faster._hybridLogCheckpoint.info.snapshotStartFlushedLogicalAddress = faster.hlog.FlushedUntilAddress;
+
                     long startPage = faster.hlog.GetPage(faster._hybridLogCheckpoint.info.snapshotStartFlushedLogicalAddress);
                     long endPage = faster.hlog.GetPage(faster._hybridLogCheckpoint.info.finalLogicalAddress);
-                    if (faster._hybridLogCheckpoint.info.finalLogicalAddress >
-                        faster.hlog.GetStartLogicalAddress(endPage))
-                    {
+                    if (faster._hybridLogCheckpoint.info.finalLogicalAddress > faster.hlog.GetStartLogicalAddress(endPage))
                         endPage++;
-                    }
 
-                    // We are writing pages outside epoch protection, so callee should be able to
-                    // handle corrupted or unexpected concurrent page changes during the flush, e.g., by
-                    // resuming epoch protection if necessary. Correctness is not affected as we will
-                    // only read safe pages during recovery.
+                    // 计算强一致需要刷到的地址
+                    requiredFlushAddress = capturedTailForThisCP;
+
+                    // 按页 flush snapshot 文件
                     faster.hlog.AsyncFlushPagesToDevice(
                         startPage,
                         endPage,
@@ -341,10 +337,10 @@ namespace FASTER.core
                         faster._hybridLogCheckpoint.snapshotFileObjectLogDevice,
                         out faster._hybridLogCheckpoint.flushedSemaphore,
                         faster.ThrottleCheckpointFlushDelayMs);
+
                     break;
 
                 case Phase.PERSISTENCE_CALLBACK:
-                    // Set actual FlushedUntil to the latest possible data in main log that is on disk
                     faster._hybridLogCheckpoint.info.flushedLogicalAddress = faster.hlog.FlushedUntilAddress;
                     base.GlobalBeforeEnteringState(next, faster);
                     faster._lastSnapshotCheckpoint = faster._hybridLogCheckpoint.Transfer();
@@ -356,7 +352,6 @@ namespace FASTER.core
             }
         }
 
-        /// <inheritdoc />
         public override void OnThreadState<Key, Value, Input, Output, Context, FasterSession>(
             SystemState current,
             SystemState prev, FasterKV<Key, Value> faster,
@@ -372,8 +367,7 @@ namespace FASTER.core
             if (ctx is null || !ctx.prevCtx.markers[EpochPhaseIdx.WaitFlush])
             {
                 var s = faster._hybridLogCheckpoint.flushedSemaphore;
-
-                var notify = s != null && s.CurrentCount > 0;
+                bool notify = s != null && s.CurrentCount > 0;
                 notify = notify || !faster.SameCycle(ctx, current) || s == null;
 
                 if (valueTasks != null && !notify)
@@ -384,6 +378,10 @@ namespace FASTER.core
 
                 if (!notify) return;
 
+                // 检查是否已刷到 requiredFlushAddress
+                if (faster.hlog.FlushedUntilAddress < requiredFlushAddress)
+                    return;
+
                 if (ctx is not null)
                     ctx.prevCtx.markers[EpochPhaseIdx.WaitFlush] = true;
             }
@@ -393,6 +391,7 @@ namespace FASTER.core
                 faster.GlobalStateMachineStep(current);
         }
     }
+
 
     /// <summary>
     /// An Incremental Snapshot makes a copy of only changes that have happened since the last full Snapshot.

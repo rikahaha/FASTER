@@ -3,6 +3,7 @@
 
 // Define below to enable continuous performance report for dashboard
 // #define DASHBOARD
+//FasterYcsbBenchmark.cs
 
 using System.Diagnostics;      // ✅ 添加这一行
 using System.IO;              // ✅ 添加这一行
@@ -76,17 +77,39 @@ namespace FASTER.benchmark
 
             device = Devices.CreateLogDevice(TestLoader.DevicePath, preallocateFile: true, deleteOnClose: !testLoader.RecoverMode, useIoCompletionPort: true);
 
+            // 创建 log 设备和 object log 设备
+            var logPath = Path.Combine(testLoader.BackupPath, "hlog.log");
+            var objPath = Path.Combine(testLoader.BackupPath, "hlog.obj");
+
+            var logDevice = Devices.CreateLogDevice(logPath, preallocateFile: true, deleteOnClose: !testLoader.RecoverMode, useIoCompletionPort: true);
+            var objDevice = Devices.CreateLogDevice(objPath, preallocateFile: true, deleteOnClose: !testLoader.RecoverMode);
+
             if (testLoader.Options.ThreadCount >= 16)
-                device.ThrottleLimit = testLoader.Options.ThreadCount * 12;
+                logDevice.ThrottleLimit = testLoader.Options.ThreadCount * 12;
 
             if (testLoader.Options.UseSmallMemoryLog)
-                store = new FasterKV<Key, Value>
-                    (testLoader.MaxKey / testLoader.Options.HashPacking, new LogSettings { LogDevice = device, PreallocateLog = true, PageSizeBits = 25, SegmentSizeBits = 30, MemorySizeBits = 28 },
-                    new CheckpointSettings { CheckpointDir = testLoader.BackupPath }, concurrencyControlMode: testLoader.ConcurrencyControlMode);
+                store = new FasterKV<Key, Value>(
+                    testLoader.MaxKey / testLoader.Options.HashPacking,
+                    new LogSettings {
+                        LogDevice = logDevice,
+                        ObjectLogDevice = objDevice,   // ⭐ 加上 ObjectLogDevice
+                        PreallocateLog = true,
+                        PageSizeBits = 25,
+                        SegmentSizeBits = 30,
+                        MemorySizeBits = 28
+                    },
+                    new CheckpointSettings { CheckpointDir = testLoader.BackupPath },
+                    concurrencyControlMode: testLoader.ConcurrencyControlMode);
             else
-                store = new FasterKV<Key, Value>
-                    (testLoader.MaxKey / testLoader.Options.HashPacking, new LogSettings { LogDevice = device, PreallocateLog = true },
-                    new CheckpointSettings { CheckpointDir = testLoader.BackupPath }, concurrencyControlMode: testLoader.ConcurrencyControlMode);
+                store = new FasterKV<Key, Value>(
+                    testLoader.MaxKey / testLoader.Options.HashPacking,
+                    new LogSettings {
+                        LogDevice = logDevice,
+                        ObjectLogDevice = objDevice,   // ⭐ 加上 ObjectLogDevice
+                        PreallocateLog = true
+                    },
+                    new CheckpointSettings { CheckpointDir = testLoader.BackupPath },
+                    concurrencyControlMode: testLoader.ConcurrencyControlMode);
         }
 
         internal void Dispose()
@@ -410,6 +433,130 @@ namespace FASTER.benchmark
             double opsPerSecond = total_ops_done / seconds;
             Console.WriteLine(TestStats.GetTotalOpsString(total_ops_done, seconds));
             Console.WriteLine(TestStats.GetStatsLine(StatsLineNum.Iteration, YcsbConstants.OpsPerSec, opsPerSecond));
+
+            // ===== 一致性检测：结束后一次性执行 =====
+            try
+            {
+                Console.WriteLine("[AUDIT] Building ground truth from current tail ...");
+                // 1) 扫描 ground truth（key->value 的最后版本）
+                var truth = new System.Collections.Generic.Dictionary<Key, Value>(capacity: 1 << 20);
+                using (var it = store.Log.Scan(store.Log.BeginAddress, store.Log.TailAddress))
+                {
+                    while (it.GetNext(out var info))
+                    {
+                        if (!info.Invalid)
+                        {
+                            var k = it.GetKey();
+                            var v = it.GetValue();
+                            truth[k] = v; // 以最后一次出现为准
+                        }
+                    }
+                }
+
+                // 2) 触发一次 checkpoint（走你的 CPR 路径）
+                Console.WriteLine("[CPR] Manually triggering checkpoint for audit ...");
+                var cpSw = System.Diagnostics.Stopwatch.StartNew();
+                if (store.TryInitiateHybridLogCheckpoint(out _, CheckpointType.FoldOver))
+                    store.CompleteCheckpointAsync().AsTask().GetAwaiter().GetResult();
+                cpSw.Stop();
+                Console.WriteLine($"[CPR] Checkpoint done in {cpSw.ElapsedMilliseconds} ms");
+
+                // 3) 模拟 crash
+                store.Dispose();
+                device.Dispose();
+
+                // 4) 重建 device / store，并 Recover()
+                var logPath2 = Path.Combine(testLoader.BackupPath, "hlog.log");
+                var objPath2 = Path.Combine(testLoader.BackupPath, "hlog.obj");
+
+                var logDevice2 = Devices.CreateLogDevice(logPath2, preallocateFile: true, deleteOnClose: !testLoader.RecoverMode, useIoCompletionPort: true);
+                var objDevice2 = Devices.CreateLogDevice(objPath2, preallocateFile: true, deleteOnClose: !testLoader.RecoverMode);
+
+                if (testLoader.Options.ThreadCount >= 16)
+                    logDevice2.ThrottleLimit = testLoader.Options.ThreadCount * 12;
+
+                FasterKV<Key, Value> store2;
+                if (testLoader.Options.UseSmallMemoryLog)
+                {
+                    store2 = new FasterKV<Key, Value>(
+                        testLoader.MaxKey / testLoader.Options.HashPacking,
+                        new LogSettings {
+                            LogDevice = logDevice2,
+                            ObjectLogDevice = objDevice2,  // ⭐ 绑定 object log
+                            PreallocateLog = true,
+                            PageSizeBits = 25,
+                            SegmentSizeBits = 30,
+                            MemorySizeBits = 28
+                        },
+                        new CheckpointSettings { CheckpointDir = testLoader.BackupPath },
+                        concurrencyControlMode: testLoader.ConcurrencyControlMode);
+                }
+                else
+                {
+                    store2 = new FasterKV<Key, Value>(
+                        testLoader.MaxKey / testLoader.Options.HashPacking,
+                        new LogSettings {
+                            LogDevice = logDevice2,
+                            ObjectLogDevice = objDevice2,  // ⭐ 绑定 object log
+                            PreallocateLog = true
+                        },
+                        new CheckpointSettings { CheckpointDir = testLoader.BackupPath },
+                        concurrencyControlMode: testLoader.ConcurrencyControlMode);
+                }
+
+
+                Console.WriteLine("[AUDIT] Recovering from last checkpoint ...");
+                store2.Recover();
+
+                // 5) 扫描恢复后的状态
+                var recovered = new System.Collections.Generic.Dictionary<Key, Value>(truth.Count);
+                using (var it2 = store2.Log.Scan(store2.Log.BeginAddress, store2.Log.TailAddress))
+                {
+                    while (it2.GetNext(out var info2))
+                    {
+                        if (!info2.Invalid)
+                        {
+                            var k = it2.GetKey();
+                            var v = it2.GetValue();
+                            recovered[k] = v;
+                        }
+                    }
+                }
+
+                // 6) 对比差异
+                int missing = 0, mismatch = 0;
+                foreach (var kv in truth)
+                {
+                    if (!recovered.TryGetValue(kv.Key, out var v2))
+                    {
+                        missing++;
+                        // 如需详细列表可打开下一行
+                        // Console.WriteLine($"[MISS] key={kv.Key.value}");
+                    }
+                    else if (!System.Collections.Generic.EqualityComparer<Value>.Default.Equals(kv.Value, v2))
+                    {
+                        mismatch++;
+                        // Console.WriteLine($"[DIFF] key={kv.Key.value}, expect={kv.Value.value}, got={v2.value}");
+                    }
+                }
+
+                if (missing == 0 && mismatch == 0)
+                    Console.WriteLine("✅ Consistency OK (no missing/mismatch)");
+                else
+                    Console.WriteLine($"❌ Consistency FAIL (missing={missing}, mismatch={mismatch})");
+
+                store2.Dispose();
+                logDevice2.Dispose();
+                objDevice2.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[AUDIT] Exception during consistency check: {ex}");
+            }
+            // ===== 一致性检测结束 =====
+
+
+
 
 
             // ✅ 手动触发 checkpoint

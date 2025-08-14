@@ -18,6 +18,13 @@ namespace FASTER.core
     {
         internal readonly AllocatorBase<Key, Value> hlog;
         internal readonly AllocatorBase<Key, Value> readcache;
+        internal long lastScannedTailAddress = -1;
+
+        // ✅ 添加这两个计数器字段（用于日志/调试）
+        internal long checkpointCollectedCount; // IN_PROGRESS 扫描收集到的条数
+        internal long checkpointFlushedCount;   // 若以后需要统计写盘数量
+
+        // 你原来的 buffer（List 版本）
         public readonly List<(long logicalAddress, long physicalAddress)> checkpointBuffer = new();///new
 
 
@@ -80,7 +87,7 @@ namespace FASTER.core
         internal void DecrementNumLockingSessions() => Interlocked.Decrement(ref this.hlog.NumActiveLockingSessions);
 
         internal readonly int ThrottleCheckpointFlushDelayMs = -1;
-        
+
         /// <summary>
         /// Create FasterKV instance
         /// </summary>
@@ -224,7 +231,7 @@ namespace FASTER.core
                 {
                     readcache = new BlittableAllocator<Key, Value>(
                         new LogSettings
-                       {
+                        {
                             LogDevice = new NullDevice(),
                             PageSizeBits = logSettings.ReadCacheSettings.PageSizeBits,
                             MemorySizeBits = logSettings.ReadCacheSettings.MemorySizeBits,
@@ -532,7 +539,7 @@ namespace FASTER.core
         /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
         /// <param name="cancellationToken">Cancellation token</param>
         /// <returns>Version we actually recovered to</returns>
-        public ValueTask<long> RecoverAsync(Guid indexCheckpointToken, Guid hybridLogCheckpointToken, int numPagesToPreload = -1, bool undoNextVersion = true, CancellationToken cancellationToken = default) 
+        public ValueTask<long> RecoverAsync(Guid indexCheckpointToken, Guid hybridLogCheckpointToken, int numPagesToPreload = -1, bool undoNextVersion = true, CancellationToken cancellationToken = default)
             => InternalRecoverAsync(indexCheckpointToken, hybridLogCheckpointToken, numPagesToPreload, undoNextVersion, -1, cancellationToken);
 
         /// <summary>
@@ -682,7 +689,7 @@ namespace FASTER.core
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal Status ContextRMW<Input, Output, Context, FasterSession>(ref Key key, long keyHash, ref Input input, ref Output output, out RecordMetadata recordMetadata, 
+        internal Status ContextRMW<Input, Output, Context, FasterSession>(ref Key key, long keyHash, ref Input input, ref Output output, out RecordMetadata recordMetadata,
                                                                           Context context, FasterSession fasterSession, long serialNo)
             where FasterSession : IFasterSession<Key, Value, Input, Output, Context>
         {

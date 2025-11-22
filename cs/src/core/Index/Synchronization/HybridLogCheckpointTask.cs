@@ -17,7 +17,7 @@ namespace FASTER.core
     internal abstract class HybridLogCheckpointOrchestrationTask : ISynchronizationTask
     {
         private long lastVersion;
-        private long lastCheckpointVersion = -1; // ✅ 记录上次处理的版本号
+        protected long lastCheckpointVersion = -1; // ✅ 记录上次处理的版本号
         private int checkpointAttemptCount = 0;  // ✅ 尝试次数统计
         private int checkpointSkipCount = 0;     // ✅ 跳过次数统计
         protected long lastScannedTailAddress = -1;
@@ -37,13 +37,12 @@ namespace FASTER.core
                     }
                     faster._hybridLogCheckpoint.info.version = next.Version;
                     // ✅ 首次或“强制全量”时，从 BeginAddress 开始；否则可用增量起点
-                    var firstOrFull = faster.lastScannedTailAddress < 0 || faster.ForceFullOnNextCheckpoint; // 后面第2处会加这个标志
+                    var firstOrFull = faster.lastScannedTailAddress < 0 || faster.ForceFullOnNextCheckpoint;
                     faster._hybridLogCheckpoint.info.startLogicalAddress = firstOrFull
                         ? faster.hlog.BeginAddress
                         : faster.lastScannedTailAddress;
                     faster._hybridLogCheckpoint.info.beginAddress = faster.hlog.BeginAddress;
                     break;
-
 
                 case Phase.IN_PROGRESS:
                     checkpointAttemptCount++;
@@ -145,81 +144,117 @@ namespace FASTER.core
     }
 
     /// <summary>
-    /// A FoldOver checkpoint persists a version by setting the read-only marker past the last entry of that
-    /// version on the log and waiting until it is flushed to disk. It is simple and fast, but can result
-    /// in garbage entries on the log, and a slower recovery of performance.
+    /// FoldOver：通过推进只读标记并刷盘到某个 cut（本版使用尾部小窗口扫描得到 cut）
     /// </summary>
     internal sealed class FoldOverCheckpointTask : HybridLogCheckpointOrchestrationTask
     {
-        private long capturedTailForThisCP = -1;
-        private long requiredFlushAddress = -1;
+        // === 可调参数 ===
+        private const long TailScanWindowBytes =  512L << 20;          // 0 = 不扫尾窗；想裁剪 cut 再开 128~512MB 做 A/B
+        private const long MaxSliceBytes   = 1024L << 20; // 片段推进：默认 1GB（可试 256MB 或 512MB）
+        
+        // === 本次 CP 的状态 ===
+        private long capturedTailForThisCP = -1;   // 进入 IN_PROGRESS 时的 Tail
+        private long requiredFlushAddress  = -1;   // 必须刷到的 cut
+        private long scannedCutAddress     = -1;   // IN_PROGRESS 扫描得到的 cut（或退化为 flushed）
+
+        // === 单协调者：避免每个线程都注册 WaitAsync ===
+        private int  waiterRegisteredVersion = -1; // 哪个 version 的等待已注册
+        private int  waiterRegisteredFlag    = 0;  // 0->未注册；1->已注册
+        private int  targetUpdateLock        = 0;  // 保护更新 finalLogicalAddress
 
         public override void GlobalBeforeEnteringState<Key, Value>(SystemState next, FasterKV<Key, Value> faster)
         {
+            // 先让基类处理 PREPARE / 元信息等
             base.GlobalBeforeEnteringState(next, faster);
 
             if (next.Phase == Phase.IN_PROGRESS)
             {
-                // 捕捉本次 CP 的 tail
+                // 1) 捕捉本次 CP 的 Tail
                 capturedTailForThisCP = faster.Log.TailAddress;
 
-                bool fullScan = faster.ForceFullOnNextCheckpoint || faster.lastScannedTailAddress < 0;
-                long scanFrom = fullScan ? faster.Log.BeginAddress : faster.lastScannedTailAddress;
-                long scanTo   = capturedTailForThisCP;
+                // 2) （可选）尾窗并行扫描，收紧 cut（TailScanWindowBytes>0 才会执行）
+                long flushed  = faster.hlog.FlushedUntilAddress;
+                long scanFrom = Math.Max(flushed, capturedTailForThisCP - TailScanWindowBytes);
+                long lastOld  = flushed; // 原子 max 聚合目标
 
-                // ✅ 防止 scanFrom >= scanTo 导致 Partitioner.Create 抛异常
-                if (scanFrom >= scanTo)
+                if (TailScanWindowBytes > 0 && scanFrom < capturedTailForThisCP)
                 {
-                    Console.WriteLine($"[CPR-MEM] No records to scan (from {scanFrom} to {scanTo})");
+                    var sw  = Stopwatch.StartNew();
+                    int dop = Math.Min(Environment.ProcessorCount,32);
+
+                    long startPage = faster.hlog.GetPage(scanFrom);
+                    long endPage   = faster.hlog.GetPage(capturedTailForThisCP);
+
+                    Parallel.ForEach(
+                        Partitioner.Create(startPage, endPage + 1),
+                        new ParallelOptions { MaxDegreeOfParallelism = dop },
+                        range =>
+                        {
+                            for (long page = range.Item1; page < range.Item2; page++)
+                            {
+                                long pageStart = faster.hlog.GetStartLogicalAddress(page);
+                                long pageEnd   = faster.hlog.GetStartLogicalAddress(page + 1);
+                                long from      = Math.Max(pageStart, scanFrom);
+                                long to        = Math.Min(pageEnd,   capturedTailForThisCP);
+                                if (from >= to) continue;
+
+                                using var it = faster.Log.Scan(from, to);
+                                while (it.GetNext(out var ri))
+                                {
+                                    if (ri.Invalid || ri.Tombstone) continue;
+                                    if (ri.IsInNewVersion) continue;  // 只看旧版本记录
+
+                                    long logical = it.CurrentAddress;
+                                    long prev;
+                                    do
+                                    {
+                                        prev = Volatile.Read(ref lastOld);
+                                        if (logical <= prev) break;
+                                    } while (Interlocked.CompareExchange(ref lastOld, logical, prev) != prev);
+                                }
+                            }
+                        });
+
+                    sw.Stop();
+                    Console.WriteLine($"[CPR-CUT] window={TailScanWindowBytes >> 20}MB, lastOld={lastOld}, tail={capturedTailForThisCP}, pages={endPage - startPage + 1}, ||={dop}, {sw.ElapsedMilliseconds} ms");
                 }
                 else
                 {
-                    var sw = Stopwatch.StartNew();
-                    int dop = Math.Min(Environment.ProcessorCount, 16);
-                    int pageSizeLogical = (int)faster.hlog.GetPageSize();
-
-                    var checkpointBag = new ConcurrentBag<(long logical, long physical)>();
-                    var rangePartition = Partitioner.Create(scanFrom, scanTo, pageSizeLogical);
-
-                    Parallel.ForEach(rangePartition, new ParallelOptions { MaxDegreeOfParallelism = dop }, slice =>
-                    {
-                        using var it = faster.Log.Scan(slice.Item1, slice.Item2);
-                        while (it.GetNext(out var ri))
-                        {
-                            if (ri.Invalid || ri.Tombstone) continue;
-                            if (!fullScan && !ri.IsInNewVersion) continue;
-
-                            long logical = it.CurrentAddress;
-                            long physical = faster.hlog.GetPhysicalAddress(logical);
-                            checkpointBag.Add((logical, physical));
-                        }
-                    });
-
-                    faster.checkpointBuffer.Clear();
-                    foreach (var tup in checkpointBag)
-                        faster.checkpointBuffer.Add(tup);
-
-                    sw.Stop();
-                    Console.WriteLine($"[CPR-MEM] Collected {faster.checkpointBuffer.Count} records " +
-                                    $"(from {scanFrom} to {scanTo}) in {sw.ElapsedMilliseconds} ms (||={dop})");
+                    Console.WriteLine("[CPR-CUT] no tail-window scan");
                 }
+
+                // 用聚合结果确定 cut（至少不小于 flushed）
+                scannedCutAddress = Math.Max(lastOld, flushed);
 
                 // 推进增量起点
                 faster.lastScannedTailAddress = capturedTailForThisCP;
             }
 
-            if (next.Phase != Phase.WAIT_FLUSH) return;
+            if (next.Phase == Phase.WAIT_FLUSH)
+            {
+                // === 1) 计算强一致刷盘的截止地址（优先用尾窗裁剪出来的 cut） ===
+                requiredFlushAddress = (scannedCutAddress >= 0) ? scannedCutAddress : capturedTailForThisCP;
 
-            // Fold-over：推进 RO 到 Tail
-            faster.hlog.ShiftReadOnlyToTail(out var _, out faster._hybridLogCheckpoint.flushedSemaphore);
+                // === 2) 启动官方异步刷盘：推进只读到 Tail，返回页落盘信号量 ===
+                faster.hlog.ShiftReadOnlyToTail(out var _, out faster._hybridLogCheckpoint.flushedSemaphore);
 
-            // 强一致 flush 目标
-            requiredFlushAddress = capturedTailForThisCP;
-            faster._hybridLogCheckpoint.info.finalLogicalAddress = requiredFlushAddress;
+                // === 3) 设定第一个切片目标，避免一次性拉到 cut 导致长等待 ===
+                long flushedNow  = faster.hlog.FlushedUntilAddress;
+                long firstTarget = flushedNow + MaxSliceBytes;
+                if (firstTarget > requiredFlushAddress) firstTarget = requiredFlushAddress;
 
-            // flush 结束后清空 buffer
-            // （如果只是验证一致性，可以保留 buffer 作检查）
+                faster._hybridLogCheckpoint.info.finalLogicalAddress = firstTarget;
+
+                // === 4) 初始化“单协调者”状态（避免重复挂等待） ===
+                waiterRegisteredVersion = (int)next.Version;
+                Volatile.Write(ref waiterRegisteredFlag, 0);
+                Volatile.Write(ref targetUpdateLock, 0);
+
+                Console.WriteLine($"[CPR-FLUSH] start: flushed={flushedNow}, cut={requiredFlushAddress}, firstTarget={firstTarget}, slice={MaxSliceBytes >> 20}MB");
+                return;
+            }
         }
+
 
         public override void OnThreadState<Key, Value, Input, Output, Context, FasterSession>(
             SystemState current,
@@ -231,28 +266,75 @@ namespace FASTER.core
             CancellationToken token = default)
         {
             base.OnThreadState(current, prev, faster, ctx, fasterSession, valueTasks, token);
-
             if (current.Phase != Phase.WAIT_FLUSH) return;
 
             if (ctx is null || !ctx.prevCtx.markers[EpochPhaseIdx.WaitFlush])
             {
                 var s = faster._hybridLogCheckpoint.flushedSemaphore;
 
-                // 等待 flush 到 requiredFlushAddress
-                if (faster.hlog.FlushedUntilAddress < requiredFlushAddress)
+                // ✅ 快路径：已经刷到 cut，直接完成
+                long flushed = faster.hlog.FlushedUntilAddress;
+                if (flushed >= requiredFlushAddress)
                 {
-                    if (valueTasks != null && s != null)
-                        valueTasks.Add(new ValueTask(s.WaitAsync(token).ContinueWith(t => s.Release())));
+                    if (ctx is not null)
+                        ctx.prevCtx.markers[EpochPhaseIdx.WaitFlush] = true;
+
+                    faster.epoch.Mark(EpochPhaseIdx.WaitFlush, current.Version);
+                    if (faster.epoch.CheckIsComplete(EpochPhaseIdx.WaitFlush, current.Version))
+                        faster.GlobalStateMachineStep(current);
                     return;
                 }
 
-                if (ctx is not null)
-                    ctx.prevCtx.markers[EpochPhaseIdx.WaitFlush] = true;
+                long sliceTarget = faster._hybridLogCheckpoint.info.finalLogicalAddress;
+
+                // 还没到当前“切片目标”：只允许一个协调者挂 WaitAsync；其他线程直接返回
+                if (flushed < sliceTarget)
+                {
+                    if (s != null && waiterRegisteredVersion == (int)current.Version)
+                    {
+                        if (Interlocked.CompareExchange(ref waiterRegisteredFlag, 1, 0) == 0)
+                        {
+                            // 只有一个线程真正挂等待，减少调度/任务堆积
+                            valueTasks?.Add(new ValueTask(s.WaitAsync(token)));
+
+                        }
+                    }
+                    return;
+                }
+
+                // 已到达当前片目标，但未到 cut：推进下一片，再次异步等待
+                if (flushed < requiredFlushAddress)
+                {
+                    if (Interlocked.CompareExchange(ref targetUpdateLock, 1, 0) == 0)
+                    {
+                        long nextTarget = flushed + MaxSliceBytes;
+                        if (nextTarget > requiredFlushAddress) nextTarget = requiredFlushAddress;
+
+                        faster._hybridLogCheckpoint.info.finalLogicalAddress = nextTarget;
+
+                        // 新的一片需要重新注册等待
+                        Volatile.Write(ref waiterRegisteredFlag, 0);
+                        Volatile.Write(ref targetUpdateLock, 0);
+
+                        Console.WriteLine($"[CPR-FLUSH] advance: flushed={flushed}, nextTarget={nextTarget}");
+                    }
+
+                    if (s != null && waiterRegisteredVersion == (int)current.Version)
+                    {
+                        if (Interlocked.CompareExchange(ref waiterRegisteredFlag, 1, 0) == 0)
+                            valueTasks?.Add(new ValueTask(s.WaitAsync(token).ContinueWith(t => s.Release())));
+                    }
+                    return;
+                }
+
+                // 理论上不会走到这里；到 cut 的快路径已在上面处理
             }
 
+            // 完成阶段推进
             faster.epoch.Mark(EpochPhaseIdx.WaitFlush, current.Version);
             if (faster.epoch.CheckIsComplete(EpochPhaseIdx.WaitFlush, current.Version))
                 faster.GlobalStateMachineStep(current);
+
         }
     }
 
@@ -262,9 +344,9 @@ namespace FASTER.core
     /// slower and more complex than a foldover, but more space-efficient on the log, and retains in-place
     /// update performance as it does not advance the readonly marker unnecessarily.
     /// </summary>
-/// <summary>
-/// 改良版 Snapshot：在 IN_PROGRESS 扫描 live data，WAIT_FLUSH 按 page flush snapshot
-/// </summary>
+    /// <summary>
+    /// 改良版 Snapshot：在 IN_PROGRESS 扫描 live data，WAIT_FLUSH 按 page flush snapshot
+    /// </summary>
     internal sealed class SnapshotCheckpointTask : HybridLogCheckpointOrchestrationTask
     {
         private long capturedTailForThisCP = -1;
@@ -284,7 +366,7 @@ namespace FASTER.core
                     // 捕捉 tail
                     capturedTailForThisCP = faster.Log.TailAddress;
 
-                    // 全量或增量扫描 live data
+                    // 全量或增量扫描 live data（如不需要可保留为仅统计）
                     bool fullScan = faster.ForceFullOnNextCheckpoint || faster.lastScannedTailAddress < 0;
                     long scanFrom = fullScan ? faster.Log.BeginAddress : faster.lastScannedTailAddress;
                     using (var it = faster.Log.Scan(scanFrom, capturedTailForThisCP))
@@ -391,7 +473,6 @@ namespace FASTER.core
                 faster.GlobalStateMachineStep(current);
         }
     }
-
 
     /// <summary>
     /// An Incremental Snapshot makes a copy of only changes that have happened since the last full Snapshot.

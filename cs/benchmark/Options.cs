@@ -95,15 +95,96 @@ namespace FASTER.benchmark
             HelpText = "Dump the distribution of each non-empty bucket in the hash table")]
         public bool DumpDistribution { get; set; }
 
+        [Option("chkptpolicy", Required = false, Default = "",
+            HelpText = "Checkpoint scheduling policy:" +
+                        "\n    (empty) = fixed if chkptms > 0, else no checkpoints" +
+                        "\n    fixed = every chkptms milliseconds" +
+                        "\n    youngdaly = Young/Daly optimum sqrt(2 * duration * MTBF)" +
+                        "\n    ucb = sliding-window UCB bandit over ucbarms, maximizing effective throughput")]
+        public string CheckpointPolicy { get; set; }
+
+        [Option("mtbfsec", Required = false, Default = 60,
+            HelpText = "Assumed mean time between failures (seconds), used by the checkpoint objective")]
+        public int MtbfSeconds { get; set; }
+
+        [Option("ucbarms", Separator = ',', Required = false, Default = new[] { 250, 500, 1000, 2000, 4000, 8000 },
+            HelpText = "Candidate checkpoint intervals (ms) for the ucb policy; also the min/max interval for youngdaly")]
+        public IEnumerable<int> UcbArmsMs { get; set; }
+
+        [Option("ucbwindow", Required = false, Default = 30,
+            HelpText = "Number of most recent checkpoint cycles the ucb policy remembers")]
+        public int UcbWindow { get; set; }
+
+        [Option("ucbc", Required = false, Default = 0.2,
+            HelpText = "Exploration coefficient of the ucb policy")]
+        public double UcbExploration { get; set; }
+
+        [Option("samplems", Required = false, Default = 100,
+            HelpText = "Throughput sampling period (ms) for the checkpoint timeline CSV")]
+        public int SampleMilliseconds { get; set; }
+
+        [Option("rumd2", Separator = ',', Required = false, Default = new int[0],
+         HelpText = "#,#,#,#: Workload mix to switch to after shiftsec seconds (same format as rumd)")]
+        public IEnumerable<int> RumdPercents2 { get; set; }
+
+        [Option("shiftsec", Required = false, Default = 0,
+            HelpText = "If > 0 and rumd2 is given, switch the workload mix to rumd2 after this many seconds")]
+        public int ShiftSeconds { get; set; }
+
+        [Option("indexpolicy", Required = false, Default = "",
+            HelpText = "When checkpoints also checkpoint the index (full checkpoint):" +
+                        "\n    (empty) = every if fullevery > 0, else none" +
+                        "\n    none = log-only checkpoints" +
+                        "\n    every = every fullevery-th checkpoint" +
+                        "\n    rto = when predicted recovery time would exceed rtosafety * rtoms")]
+        public string IndexPolicy { get; set; }
+
+        [Option("fullevery", Required = false, Default = 0,
+            HelpText = "For indexpolicy every: every Nth checkpoint (starting with the first) is a full checkpoint (index + log)")]
+        public int FullCheckpointEvery { get; set; }
+
+        [Option("rtoms", Required = false, Default = 1000,
+            HelpText = "Recovery time objective (ms): the target of indexpolicy rto, and the threshold for counting violations")]
+        public int RtoMilliseconds { get; set; }
+
+        [Option("rtosafety", Required = false, Default = 0.8,
+            HelpText = "Fraction of rtoms that indexpolicy rto aims for")]
+        public double RtoSafety { get; set; }
+
+        [Option("recfixedms", Required = false, Default = 200.0,
+            HelpText = "Recovery model: fixed recovery cost (ms), e.g. loading the index")]
+        public double RecoveryFixedMs { get; set; }
+
+        [Option("recmspermb", Required = false, Default = 1.4,
+            HelpText = "Recovery model: cost (ms) of replaying each MB of log written since the last index checkpoint")]
+        public double RecoveryMsPerMB { get; set; }
+
+        [Option("recoverytest", Required = false, Default = false,
+            HelpText = "After the run, discard the store and time recovery from the last checkpoint (requires checkpointing)")]
+        public bool RecoveryTest { get; set; }
+
+        [Option("resultprefix", Required = false, Default = "ckpt",
+            HelpText = "Prefix of the checkpoint result CSV files")]
+        public string ResultPrefix { get; set; }
+
         internal CheckpointType PeriodicCheckpointType => this.PeriodicCheckpointUseSnapshot ? CheckpointType.Snapshot : CheckpointType.FoldOver;
+
+        internal string EffectiveCheckpointPolicy
+            => this.CheckpointPolicy != "" ? this.CheckpointPolicy.ToLower() : this.PeriodicCheckpointMilliseconds > 0 ? "fixed" : "none";
+
+        internal bool CheckpointingEnabled => this.EffectiveCheckpointPolicy != "none";
+
+        internal string EffectiveIndexPolicy
+            => this.IndexPolicy != "" ? this.IndexPolicy.ToLower() : this.FullCheckpointEvery > 0 ? "every" : "none";
 
         public string GetOptionsString()
         {
             static string boolStr(bool value) => value ? "y" : "n";
             return $"d: {DistributionName.ToLower()}; n: {NumaStyle}; rumd: {string.Join(',', RumdPercents)}; t: {ThreadCount}; z: {ConcurrencyControlMode}; i: {IterationCount}; hp: {HashPacking}"
                         + $" sd: {boolStr(UseSmallData)}; sm: {boolStr(UseSmallMemoryLog)}; sy: {boolStr(this.UseSyntheticData)}; safectx: {boolStr(this.UseSafeContext)};"
-                        + $" chkptms: {this.PeriodicCheckpointMilliseconds}; chkpttype: {(this.PeriodicCheckpointMilliseconds > 0 ? this.PeriodicCheckpointType.ToString() : "None")};"
-                        + $" chkptincr: {boolStr(this.PeriodicCheckpointTryIncremental)}";
+                        + $" chkptms: {this.PeriodicCheckpointMilliseconds}; chkpttype: {(this.CheckpointingEnabled ? this.PeriodicCheckpointType.ToString() : "None")};"
+                        + $" chkptincr: {boolStr(this.PeriodicCheckpointTryIncremental)}; chkptpolicy: {this.EffectiveCheckpointPolicy}; mtbfsec: {this.MtbfSeconds}; indexpolicy: {this.EffectiveIndexPolicy}; fullevery: {this.FullCheckpointEvery}; rtoms: {this.RtoMilliseconds}"
+                        + (this.ShiftSeconds > 0 ? $"; rumd2: {string.Join(',', RumdPercents2)} @ {this.ShiftSeconds}s" : "");
         }
     }
 }

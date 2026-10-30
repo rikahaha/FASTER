@@ -4,11 +4,11 @@
 // Define below to enable continuous performance report for dashboard
 // #define DASHBOARD
 
-using System.Diagnostics;      // ✅ 添加这一行
-using System.IO;              // ✅ 添加这一行
 using FASTER.core;
 using System;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -23,19 +23,26 @@ namespace FASTER.benchmark
         readonly TestLoader testLoader;
         readonly ManualResetEventSlim waiter = new();
         readonly int numaStyle;
-        readonly int readPercent, upsertPercent, rmwPercent;
+        // Not readonly: the workload mix may be switched mid-run (see Options.ShiftSeconds).
+        volatile int readPercent, upsertPercent, rmwPercent;
         readonly Functions functions;
         readonly Input[] input_;
 
         readonly Key[] init_keys_;
         readonly Key[] txn_keys_;
 
-        readonly IDevice device;
-        readonly FasterKV<Key, Value> store;
+        // Not readonly: the recovery test replaces them with a freshly recovered store.
+        IDevice device;
+        FasterKV<Key, Value> store;
 
         long idx_ = 0;
         long total_ops_done = 0;
         volatile bool done = false;
+
+        // Per-thread running op counts, published periodically so the checkpoint scheduler can observe live throughput.
+        // Each thread's slot is a cache line apart to avoid false sharing.
+        const int kProgressStride = 16;
+        readonly long[] progress;
 
         internal FASTER_YcsbBenchmark(Key[] i_keys_, Key[] t_keys_, TestLoader testLoader)
         {
@@ -54,6 +61,7 @@ namespace FASTER.benchmark
             readPercent = testLoader.ReadPercent;
             upsertPercent = testLoader.UpsertPercent;
             rmwPercent = testLoader.RmwPercent;
+            progress = new long[testLoader.Options.ThreadCount * kProgressStride];
             functions = new Functions();
 
 #if DASHBOARD
@@ -74,19 +82,46 @@ namespace FASTER.benchmark
             for (int i = 0; i < 8; i++)
                 input_[i].value = i;
 
-            device = Devices.CreateLogDevice(TestLoader.DevicePath, preallocateFile: true, deleteOnClose: !testLoader.RecoverMode, useIoCompletionPort: true);
+            // The recovery test reopens the log after the run, so it must survive the first store, and must not see
+            // checkpoints left over from earlier runs.
+            if (testLoader.Options.RecoveryTest && Directory.Exists(testLoader.CheckpointPath))
+                Directory.Delete(testLoader.CheckpointPath, recursive: true);
+
+            (device, store) = CreateStore(preallocateFile: true, deleteOnClose: !testLoader.RecoverMode && !testLoader.Options.RecoveryTest);
+        }
+
+        private (IDevice, FasterKV<Key, Value>) CreateStore(bool preallocateFile, bool deleteOnClose)
+        {
+            var device = Devices.CreateLogDevice(TestLoader.DevicePath, preallocateFile: preallocateFile, deleteOnClose: deleteOnClose, useIoCompletionPort: true);
 
             if (testLoader.Options.ThreadCount >= 16)
                 device.ThrottleLimit = testLoader.Options.ThreadCount * 12;
 
-            if (testLoader.Options.UseSmallMemoryLog)
-                store = new FasterKV<Key, Value>
-                    (testLoader.MaxKey / testLoader.Options.HashPacking, new LogSettings { LogDevice = device, PreallocateLog = true, PageSizeBits = 25, SegmentSizeBits = 30, MemorySizeBits = 28 },
-                    new CheckpointSettings { CheckpointDir = testLoader.BackupPath }, concurrencyControlMode: testLoader.ConcurrencyControlMode);
-            else
-                store = new FasterKV<Key, Value>
-                    (testLoader.MaxKey / testLoader.Options.HashPacking, new LogSettings { LogDevice = device, PreallocateLog = true },
-                    new CheckpointSettings { CheckpointDir = testLoader.BackupPath }, concurrencyControlMode: testLoader.ConcurrencyControlMode);
+            var logSettings = testLoader.Options.UseSmallMemoryLog
+                ? new LogSettings { LogDevice = device, PreallocateLog = true, PageSizeBits = 25, SegmentSizeBits = 30, MemorySizeBits = 28 }
+                : new LogSettings { LogDevice = device, PreallocateLog = true };
+            var store = new FasterKV<Key, Value>(testLoader.MaxKey / testLoader.Options.HashPacking, logSettings,
+                new CheckpointSettings { CheckpointDir = testLoader.CheckpointPath }, concurrencyControlMode: testLoader.ConcurrencyControlMode);
+            return (device, store);
+        }
+
+        /// <summary>
+        /// Simulates a crash after the run: drops the store without checkpointing again, then recovers a new store
+        /// from the last checkpoint. Returns the recovery time in milliseconds.
+        /// </summary>
+        private double RunRecoveryTest()
+        {
+            store.Dispose();
+            device.Dispose();
+
+            (device, store) = CreateStore(preallocateFile: false, deleteOnClose: true);
+            var sw = Stopwatch.StartNew();
+            var version = store.Recover();
+            sw.Stop();
+
+            Console.WriteLine($"Recovered version {version} in {sw.Elapsed.TotalMilliseconds:N1} ms");
+            Console.WriteLine(TestStats.GetAddressesLine(AddressLineNum.After, store.Log.BeginAddress, store.Log.HeadAddress, store.Log.ReadOnlyAddress, store.Log.TailAddress));
+            return sw.Elapsed.TotalMilliseconds;
         }
 
         internal void Dispose()
@@ -147,6 +182,7 @@ namespace FASTER.benchmark
                         {
                             uContext.Refresh();
                             uContext.CompletePending(false);
+                            Volatile.Write(ref progress[thread_idx * kProgressStride], reads_done + writes_done + deletes_done);
                         }
 
                         int r = (int)rng.Generate(100);     // rng.Next() is not inclusive of the upper bound so this will be <= 99
@@ -250,6 +286,7 @@ namespace FASTER.benchmark
                         if (!testLoader.Options.UseSafeContext)
                             session.Refresh();
                         session.CompletePending(false);
+                        Volatile.Write(ref progress[thread_idx * kProgressStride], reads_done + writes_done + deletes_done);
                     }
 
                     int r = (int)rng.Generate(100);     // rng.Next() is not inclusive of the upper bound so this will be <= 99
@@ -342,7 +379,7 @@ namespace FASTER.benchmark
                 Console.WriteLine(store.DumpDistribution());
 
             // Ensure first fold-over checkpoint is fast
-            if (testLoader.Options.PeriodicCheckpointMilliseconds > 0 && testLoader.Options.PeriodicCheckpointType == CheckpointType.FoldOver)
+            if (testLoader.Options.CheckpointingEnabled && testLoader.Options.PeriodicCheckpointType == CheckpointType.FoldOver)
                 store.Log.ShiftReadOnlyAddress(store.Log.TailAddress, true);
 
             Console.WriteLine("Executing experiment.");
@@ -365,28 +402,20 @@ namespace FASTER.benchmark
             waiter.Set();
             var swatch = Stopwatch.StartNew();
 
-            if (testLoader.Options.PeriodicCheckpointMilliseconds <= 0)
+            using var shiftTimer = testLoader.Options.ShiftSeconds > 0
+                ? new Timer(_ => ShiftWorkloadMix(), null, TimeSpan.FromSeconds(testLoader.Options.ShiftSeconds), Timeout.InfiniteTimeSpan)
+                : null;
+
+            CheckpointScheduler<Key, Value> scheduler = null;
+            if (!testLoader.Options.CheckpointingEnabled)
             {
                 Thread.Sleep(TimeSpan.FromSeconds(testLoader.Options.RunSeconds));
             }
             else
             {
-                var checkpointTaken = 0;
-                while (swatch.ElapsedMilliseconds < 1000 * testLoader.Options.RunSeconds)
-                {
-                    if (checkpointTaken < swatch.ElapsedMilliseconds / testLoader.Options.PeriodicCheckpointMilliseconds)
-                    {
-                        long start = swatch.ElapsedTicks;
-                        if (store.TryInitiateHybridLogCheckpoint(out _, testLoader.Options.PeriodicCheckpointType, testLoader.Options.PeriodicCheckpointTryIncremental))
-                        {
-                            store.CompleteCheckpointAsync().AsTask().GetAwaiter().GetResult();
-                            var timeTaken = (swatch.ElapsedTicks - start) / TimeSpan.TicksPerMillisecond;
-                            Console.WriteLine("Checkpoint time: {0}ms", timeTaken);
-                            checkpointTaken++;
-                        }
-                    }
-                }
-                Console.WriteLine($"Checkpoint taken {checkpointTaken}");
+                scheduler = CreateCheckpointScheduler();
+                scheduler.Run(swatch, 1000.0 * testLoader.Options.RunSeconds, testLoader.Options.ResultPrefix);
+                Console.WriteLine($"Checkpoint taken {scheduler.Cycles.Count}");
             }
 
             swatch.Stop();
@@ -411,34 +440,82 @@ namespace FASTER.benchmark
             Console.WriteLine(TestStats.GetTotalOpsString(total_ops_done, seconds));
             Console.WriteLine(TestStats.GetStatsLine(StatsLineNum.Iteration, YcsbConstants.OpsPerSec, opsPerSecond));
 
-
-            // ✅ 手动触发 checkpoint
-            Console.WriteLine("[CPR] Manually triggering checkpoint...");
-            var swCheckpoint = Stopwatch.StartNew();     // ✅ 改名避免冲突
-            if (store.TryInitiateHybridLogCheckpoint(out _, CheckpointType.FoldOver))
-                {
-                    store.CompleteCheckpointAsync().AsTask().GetAwaiter().GetResult();
-                }
-
-            swCheckpoint.Stop();
-            long checkpointTimeMs = swCheckpoint.ElapsedMilliseconds;
-            Console.WriteLine($"[CPR] Checkpoint completed in {checkpointTimeMs} ms");
-
-            // ✅ 自动写入 CSV
-            int numThreads = testLoader.Options.ThreadCount;
-            int numKeys = testLoader.init_keys.Length;
-            double opsPerSec = opsPerSecond;
-            string method = "CPR";
-
-            string resultPath = "cpr_experiment_results.csv";
-            if (!File.Exists(resultPath))
+            if (scheduler is not null)
             {
-                File.WriteAllText(resultPath, "Timestamp,Threads,Keys,CheckpointMs,OpsPerSec,Method\n");
+                var recoveryMs = testLoader.Options.RecoveryTest ? RunRecoveryTest() : -1;
+                AppendCheckpointSummary(scheduler, opsPerSecond, recoveryMs);
             }
-            string line = $"{DateTime.Now},{numThreads},{numKeys},{checkpointTimeMs},{opsPerSec},{method}";
-            File.AppendAllText(resultPath, line + "\n");
-            Console.WriteLine($"[LOG] Result saved to {resultPath}");
             return (insertsPerSecond, opsPerSecond);
+        }
+
+        private long OpsDoneSoFar()
+        {
+            long sum = 0;
+            for (int i = 0; i < testLoader.Options.ThreadCount; i++)
+                sum += Volatile.Read(ref progress[i * kProgressStride]);
+            return sum;
+        }
+
+        private CheckpointScheduler<Key, Value> CreateCheckpointScheduler()
+        {
+            var options = testLoader.Options;
+            double mtbfMs = 1000.0 * options.MtbfSeconds;
+            var armsMs = options.UcbArmsMs.Select(x => (double)x).OrderBy(x => x).ToArray();
+
+            ICheckpointPolicy policy = options.EffectiveCheckpointPolicy switch
+            {
+                "fixed" => new FixedIntervalPolicy(options.PeriodicCheckpointMilliseconds),
+                "youngdaly" => new YoungDalyPolicy(mtbfMs, armsMs.First(), armsMs.Last()),
+                "ucb" => new SlidingWindowUcbPolicy(armsMs, mtbfMs, options.UcbWindow, options.UcbExploration),
+                _ => throw new InvalidOperationException($"Unknown checkpoint policy: {options.EffectiveCheckpointPolicy}")
+            };
+
+            var recoveryModel = new RecoveryModel(options.RecoveryFixedMs, options.RecoveryMsPerMB);
+            IIndexCheckpointPolicy indexPolicy = options.EffectiveIndexPolicy switch
+            {
+                "none" => new NoIndexCheckpointPolicy(),
+                "every" => new EveryNthIndexCheckpointPolicy(options.FullCheckpointEvery),
+                "rto" => new RtoIndexCheckpointPolicy(recoveryModel, options.RtoMilliseconds, options.RtoSafety),
+                _ => throw new InvalidOperationException($"Unknown index policy: {options.EffectiveIndexPolicy}")
+            };
+
+            return new CheckpointScheduler<Key, Value>(store, policy, indexPolicy, recoveryModel, OpsDoneSoFar, options.PeriodicCheckpointType,
+                options.PeriodicCheckpointTryIncremental, mtbfMs, options.SampleMilliseconds);
+        }
+
+        private void ShiftWorkloadMix()
+        {
+            // Workers read these without synchronization; a mix that is briefly inconsistent across the three fields is harmless.
+            readPercent = testLoader.ReadPercent2;
+            upsertPercent = testLoader.UpsertPercent2;
+            rmwPercent = testLoader.RmwPercent2;
+            Console.WriteLine($"Workload mix switched to rumd {string.Join(',', testLoader.Options.RumdPercents2)}");
+        }
+
+        private void AppendCheckpointSummary(CheckpointScheduler<Key, Value> scheduler, double opsPerSecond, double recoveryMs)
+        {
+            var options = testLoader.Options;
+            var cycles = scheduler.Cycles;
+            var fullCycles = cycles.Where(c => c.Full).ToList();
+            var predicted = scheduler.PredictedRecoveryMs.ToList();
+            var path = options.ResultPrefix + "_summary.csv";
+            if (!File.Exists(path))
+                File.WriteAllText(path, "timestamp,policy,checkpoint_type,distribution,rumd,rumd2,shift_sec,threads,run_sec,mtbf_sec,"
+                                        + "checkpoints,mean_interval_ms,mean_duration_ms,ops_per_sec,effective_ops_per_sec,"
+                                        + "index_policy,full_checkpoints,mean_full_duration_ms,recovery_scan_mb_est,recovery_ms,"
+                                        + "rto_ms,max_predicted_recovery_ms,rto_violations" + Environment.NewLine);
+
+            var line = $"{DateTime.Now:s},{options.EffectiveCheckpointPolicy},{options.PeriodicCheckpointType},{testLoader.Distribution},"
+                + $"{string.Join(' ', options.RumdPercents)},{string.Join(' ', options.RumdPercents2)},{options.ShiftSeconds},{options.ThreadCount},"
+                + $"{options.RunSeconds},{options.MtbfSeconds},{cycles.Count},"
+                + FormattableString.Invariant($"{(cycles.Count == 0 ? 0 : cycles.Average(c => c.IntervalMs)):F1},{(cycles.Count == 0 ? 0 : cycles.Average(c => c.DurationMs)):F1},")
+                + FormattableString.Invariant($"{opsPerSecond:F0},{scheduler.EffectiveThroughput():F0},")
+                + $"{scheduler.IndexPolicyName},"
+                + FormattableString.Invariant($"{fullCycles.Count},{(fullCycles.Count == 0 ? 0 : fullCycles.Average(c => c.DurationMs)):F1},")
+                + FormattableString.Invariant($"{scheduler.RecoveryScanEstimateBytes / 1e6:F1},{recoveryMs:F1},")
+                + FormattableString.Invariant($"{options.RtoMilliseconds},{(predicted.Count == 0 ? 0 : predicted.Max()):F1},{predicted.Count(p => p > options.RtoMilliseconds)}");
+            File.AppendAllText(path, line + Environment.NewLine);
+            Console.WriteLine($"Checkpoint results written to {options.ResultPrefix}_{{timeline,cycles,summary}}.csv");
         }
 
         private void SetupYcsbUnsafeContext(int thread_idx)

@@ -38,6 +38,9 @@ namespace FASTER.benchmark
         // RUMD percentages. Delete is not a percent; it will fire automatically if the others do not sum to 100, saving an 'if'.
         internal readonly int ReadPercent, UpsertPercent, RmwPercent;
 
+        // Cumulative RUMD percentages to switch to after Options.ShiftSeconds (only set if ShiftSeconds > 0).
+        internal readonly int ReadPercent2, UpsertPercent2, RmwPercent2;
+
         internal TestLoader(string[] args)
         {
             error = true;
@@ -94,10 +97,49 @@ namespace FASTER.benchmark
                 this.RmwPercent = this.UpsertPercent + rumdPercents[2];
             }
 
+            var rumdPercents2 = Options.RumdPercents2.ToArray();
+            if (Options.ShiftSeconds > 0)
+            {
+                if (!verifyOption(rumdPercents2.Length == 4 && rumdPercents2.Sum() == 100 && !rumdPercents2.Any(x => x < 0), "rumd2",
+                        "Percentages of [(r)eads,(u)pserts,r(m)ws,(d)eletes] must sum to 100 with no negative elements when shiftsec > 0"))
+                    return;
+                this.ReadPercent2 = rumdPercents2[0];
+                this.UpsertPercent2 = this.ReadPercent2 + rumdPercents2[1];
+                this.RmwPercent2 = this.UpsertPercent2 + rumdPercents2[2];
+            }
+
+            if (!verifyOption(Options.EffectiveCheckpointPolicy is "none" or "fixed" or "youngdaly" or "ucb", "chkptpolicy",
+                    "Must be one of fixed, youngdaly, ucb"))
+                return;
+            if (!verifyOption(this.BenchmarkType == BenchmarkType.Ycsb || (Options.CheckpointPolicy == "" && Options.ShiftSeconds == 0), "chkptpolicy/shiftsec",
+                    "Checkpoint policies and workload shifts are only supported by the YCSB benchmark (-b 0)"))
+                return;
+            if (!verifyOption(Options.EffectiveCheckpointPolicy != "fixed" || Options.PeriodicCheckpointMilliseconds > 0, "chkptms",
+                    "The fixed checkpoint policy requires chkptms > 0"))
+                return;
+            if (!verifyOption(Options.UcbArmsMs.Any() && Options.UcbArmsMs.All(x => x > 0), "ucbarms", "Must be a non-empty list of positive intervals"))
+                return;
+            if (!verifyOption(Options.MtbfSeconds > 0 && Options.UcbWindow > 0 && Options.SampleMilliseconds > 0, "mtbfsec/ucbwindow/samplems", "Must be positive"))
+                return;
+            if (!verifyOption(Options.FullCheckpointEvery >= 0, "fullevery", "Must be >= 0"))
+                return;
+            if (!verifyOption(Options.EffectiveIndexPolicy is "none" or "every" or "rto", "indexpolicy", "Must be one of none, every, rto"))
+                return;
+            if (!verifyOption(Options.EffectiveIndexPolicy != "every" || Options.FullCheckpointEvery > 0, "fullevery",
+                    "indexpolicy every requires fullevery > 0"))
+                return;
+            if (!verifyOption(Options.RtoMilliseconds > 0 && Options.RtoSafety > 0 && Options.RtoSafety <= 1
+                    && Options.RecoveryFixedMs >= 0 && Options.RecoveryMsPerMB > 0, "rtoms/rtosafety/recfixedms/recmspermb",
+                    "Require rtoms > 0, 0 < rtosafety <= 1, recfixedms >= 0, recmspermb > 0"))
+                return;
+            if (!verifyOption(!Options.RecoveryTest || (Options.CheckpointingEnabled && this.BenchmarkType == BenchmarkType.Ycsb), "recoverytest",
+                    "Requires the YCSB benchmark (-b 0) with a checkpoint policy or chkptms > 0"))
+                return;
+
             this.InitCount = this.Options.UseSmallData ? 2500480 : 250000000;
             this.TxnCount = this.Options.UseSmallData ? 10000000 : 1000000000;
             this.MaxKey = this.Options.UseSmallData ? 1 << 22 : 1 << 28;
-            this.RecoverMode = Options.BackupAndRestore && Options.PeriodicCheckpointMilliseconds <= 0;
+            this.RecoverMode = Options.BackupAndRestore && !Options.CheckpointingEnabled;
 
             error = false;
         }
@@ -347,6 +389,9 @@ namespace FASTER.benchmark
         internal static string DevicePath => $"{DataPath}/hlog";
 
         internal string BackupPath => $"{DataPath}/{this.Distribution}_{(this.Options.UseSyntheticData ? "synthetic" : "ycsb")}_{(this.Options.UseSmallData ? "2.5M_10M" : "250M_1000M")}";
+
+        // The recovery test gets its own directory, which it clears before each run.
+        internal string CheckpointPath => this.Options.RecoveryTest ? $"{DataPath}/recoverytest" : BackupPath;
 
         internal bool MaybeRecoverStore<K, V>(FasterKV<K, V> store)
         {

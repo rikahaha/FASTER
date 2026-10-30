@@ -18,9 +18,6 @@ namespace FASTER.core
     {
         internal readonly AllocatorBase<Key, Value> hlog;
         internal readonly AllocatorBase<Key, Value> readcache;
-        public readonly List<(long logicalAddress, long physicalAddress)> checkpointBuffer = new();///new
-
-
 
         /// <summary>
         /// Compares two keys
